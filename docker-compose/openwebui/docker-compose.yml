@@ -7,7 +7,10 @@ services:
     restart: always
     ports:
       - "80:8080"
-    user: "1000:1000"   # makes container run as your host user, so files in /mnt/data/owui aren’t owned by root
+    user: "1000:1000"
+    working_dir: /app/backend/data
+    environment:
+      WEBUI_SECRET_KEY: "f4c9f84a8d6a7e2f5c34a9c9e5db7a68f21a5cbd8c6d47e3b82d1d0d2f9a7c3e"
     volumes:
       - /mnt/data/owui:/app/backend/data
     security_opt:
