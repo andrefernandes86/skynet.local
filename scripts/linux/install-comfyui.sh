@@ -59,10 +59,11 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
       - TZ=America/Chicago
     volumes:
-      - ./models:/comfyui/models
-      - ./input:/comfyui/input
-      - ./output:/comfyui/output
-      - ./custom_nodes:/comfyui/custom_nodes
+      - /mnt/data/comfyui/models:/opt/ComfyUI/models
+      - /mnt/data/comfyui/input:/comfyui/input
+      - /mnt/data/comfyui/output:/comfyui/output
+      - /mnt/data/comfyui/custom_nodes:/comfyui/custom_nodes
+
 YAML
 
 echo "[3/5] Prepare host folders"
