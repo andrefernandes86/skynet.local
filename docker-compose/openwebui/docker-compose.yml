@@ -10,10 +10,5 @@ services:
     user: "1000:1000"   # makes container run as your host user, so files in /mnt/data/owui aren’t owned by root
     volumes:
       - /mnt/data/owui:/app/backend/data
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080 >/dev/null 2>&1 || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 10
     security_opt:
       - no-new-privileges:true
