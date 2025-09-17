@@ -1,46 +1,69 @@
 #!/usr/bin/env bash
-# demo-suite.sh — Menu to manage Trend Micro demos on your K8s lab
-# Items:
-#  0) Check status (what’s installed + pods by node)
-#  1) Remove Container Security
-# 11) Install/Upgrade Container Security
-#  2) Remove File Security
-# 22) Install/Upgrade File Security (auto-expose via NodePort)
-#  3) Status board (easy-to-read table)
-#  4) Show URLs (remote access & internal)
-#  5) Deploy Malicious Lab (DVWA+Malware; fixed hostPorts)
-#  6) Deploy Normal Lab (OpenWebUI+Ollama; fixed)
-#  7) Remove Malicious & Normal Labs
+# demo-suite.sh — Categorized menu to manage Trend Micro demos on your K8s lab
+#
+# Categories & items:
+# STATUS
+#  10) Check status (installed + pods by node)
+#  11) Status board (easy-to-read table)
+#  12) Show URLs (remote access for services)
+#
+# PLATFORM TOOLS (Container/File Security)
+#  20) Install/Upgrade Container Security (with TTL enforcer)
+#  21) Remove Container Security
+#  22) Install/Upgrade File Security (expose via NodePort + TTL enforcer)
+#  23) Remove File Security
+#
+# DEMOS (Post-deployment)
+#  30) Deploy Malicious Lab (DVWA+Malware; hostPorts on node2)
+#  31) Deploy Normal Lab (OpenWebUI+Ollama; NodePorts)
+#  32) Remove Malicious & Normal Labs
+#
+# Notes:
+# - TTL enforcer prevents leftover trendmicro-scan-job-* by patching ttlSecondsAfterFinished.
+# - File Security scanner is exposed via NodePort so remote clients can connect.
 
 set -euo pipefail
 
-# -------- Config (edit if needed) --------
+# -------- Config --------
 REL_CS="trendmicro"                       # Container Security Helm release
 NS_CS="trendmicro-system"
 CS_CHART_URL="https://github.com/trendmicro/visionone-container-security-helm/archive/main.tar.gz"
 OVERRIDES="./overrides.yaml"
 
-FS_NS="visionone-filesecurity"            # File Security
+FS_NS="visionone-filesecurity"            # File Security namespace
 FS_REL_DEFAULT="my-release"
 FS_NODEPORT_SVC="v1fs-scanner-nodeport"
-FS_NODEPORT=32051                         # external port for gRPC (Pod listens on 50051)
+FS_NODEPORT=32051                         # external port for gRPC (scanner listens on 50051)
 
 OPENWEBUI_NODEPORT=30080
 OLLAMA_NODEPORT=31134
 
-# -------- Styling --------
-BOLD=$'\e[1m'; DIM=$'\e[2m'; RESET=$'\e[0m'
-RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; BLUE=$'\e[34m'; CYAN=$'\e[36m'
-OK="✅"; WARN="⚠️ "; ERR="❌"; INFO="ℹ️ "
-COLS="$(tput cols 2>/dev/null || echo 80)"
-hr(){ printf "${DIM}%*s${RESET}\n" "$COLS" | tr ' ' '─'; }
-box(){ local t="$1"; hr; printf "${BOLD}${t}${RESET}\n"; hr; }
+# TTL enforcer (deployed to NS_CS, works cluster-wide)
+TTL_ENF_SA="scanjob-ttl-enforcer"
+TTL_ENF_CR="scanjob-ttl-enforcer"
+TTL_ENF_CRB="scanjob-ttl-enforcer"
+TTL_ENF_CJ="scanjob-ttl-enforcer"
+TTL_SECONDS="${TTL_SECONDS:-600}"         # default 10 minutes
+
+# -------- Styling (ASCII-safe) --------
+BOLD=$'\e[1m'; RESET=$'\e[0m'
+WARN="⚠️ "; ERR="❌"; OK="✅"; INFO="ℹ️ "
+is_utf8(){ locale charmap 2>/dev/null | grep -qi 'utf-8'; }
+hr(){
+  local cols="$(tput cols 2>/dev/null || echo 80)"
+  if is_utf8; then printf "%*s\n" "$cols" | tr ' ' '─'; else printf "%*s\n" "$cols" | tr ' ' '-'; fi
+}
+box(){
+  local t="$1"
+  hr
+  if is_utf8; then printf "\e[1m%s\e[0m\n" "$t"; else printf "%s\n" "$t"; fi
+  hr
+}
 need(){ command -v "$1" >/dev/null || { echo "${ERR} Missing: $1"; exit 1; } }
 
 # -------- Node discovery --------
 node_ip(){ local n="${1:-}"; [ -z "$n" ] && return 0; kubectl get node "$n" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true; }
 has_node(){ kubectl get node "$1" >/dev/null 2>&1; }
-
 detect_master(){
   local m
   m=$(kubectl get nodes -l 'node-role.kubernetes.io/control-plane' -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
@@ -77,52 +100,181 @@ print_nodes_table(){
 }
 node_ips_all(){ kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' | sort -u; }
 
-# -------- Status helpers --------
+# -------- Install/Status helpers --------
 installed_cs(){ helm status "$REL_CS" -n "$NS_CS" >/dev/null 2>&1 && echo "yes" || echo ""; }
 find_fs_release(){
-  # Return first release in FS_NS whose chart is visionone-filesecurity/*
   helm list -n "$FS_NS" -o json 2>/dev/null | awk -v IGNORECASE=1 -F'"' '/visionone-filesecurity/ {for(i=1;i<=NF;i++){if($i=="name"){print $(i+2); exit}}}'
 }
 installed_fs(){ local r; r="$(find_fs_release)"; [ -n "$r" ] && echo "$r" || echo ""; }
+ensure_ns(){ kubectl create ns "$1" --dry-run=client -o yaml | kubectl apply -f - >/dev/null; }
 
-# -------- Item 0: Check status (what’s installed + pods by node) --------
-item_check_status(){
+# ======= TTL ENFORCER (prevents leftover scan jobs) =======
+install_ttl_enforcer(){
+  echo "${INFO} Installing TTL enforcer (ttlSecondsAfterFinished=${TTL_SECONDS})"
+  ensure_ns "$NS_CS"
+
+  kubectl -n "$NS_CS" apply -f - <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${TTL_ENF_SA}
+  namespace: ${NS_CS}
+EOF
+
+  kubectl apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ${TTL_ENF_CR}
+rules:
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["get","list","watch","patch","update"]
+EOF
+
+  kubectl apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ${TTL_ENF_CRB}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ${TTL_ENF_CR}
+subjects:
+- kind: ServiceAccount
+  name: ${TTL_ENF_SA}
+  namespace: ${NS_CS}
+EOF
+
+  kubectl -n "$NS_CS" apply -f - <<EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ${TTL_ENF_CJ}
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: ${TTL_ENF_SA}
+          restartPolicy: OnFailure
+          containers:
+          - name: kubectl
+            image: bitnami/kubectl:1.30
+            imagePullPolicy: IfNotPresent
+            command: ["/bin/sh","-c"]
+            args:
+              - |
+                set -eu
+                kubectl get jobs -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' \
+                | awk -F'\t' '\$2 ~ /^trendmicro-scan-job-/' \
+                | while IFS=$'\t' read ns name; do
+                    kubectl -n "$ns" patch job "$name" --type=merge -p '{"spec":{"ttlSecondsAfterFinished":'"${TTL_SECONDS}"'}}' >/dev/null 2>&1 || true
+                  done
+EOF
+
+  echo "${OK} TTL enforcer deployed."
+}
+remove_ttl_enforcer(){
+  echo "${INFO} Removing TTL enforcer..."
+  kubectl -n "$NS_CS" delete cronjob "${TTL_ENF_CJ}" --ignore-not-found
+  kubectl delete clusterrolebinding "${TTL_ENF_CRB}" --ignore-not-found
+  kubectl delete clusterrole "${TTL_ENF_CR}" --ignore-not-found
+  kubectl -n "$NS_CS" delete serviceaccount "${TTL_ENF_SA}" --ignore-not-found
+  echo "${OK} TTL enforcer removed."
+}
+cleanup_scan_jobs_now(){
+  echo "${INFO} Forcing cleanup of trendmicro-scan-job-* by setting TTL=1s..."
+  kubectl get jobs -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' \
+  | awk -F'\t' '$2 ~ /^trendmicro-scan-job-/' \
+  | while IFS=$'\t' read -r ns name; do
+      kubectl -n "$ns" patch job "$name" --type=merge -p '{"spec":{"ttlSecondsAfterFinished":1}}' >/dev/null 2>&1 || true
+    done
+  echo "${OK} TTL set; K8s TTL controller will delete finished jobs promptly."
+}
+
+# ===================== STATUS =====================
+status_check(){
   need kubectl; need helm
   local master node1 node2
   master="$(detect_master)"; read -r node1 node2 <<<"$(detect_workers "$master")"
   print_nodes_table "$master" "$node1" "$node2"
 
   box "What’s Installed"
-  if [ -n "$(installed_cs)" ]; then
-    echo "Container Security: ${GREEN}installed${RESET} (release: ${REL_CS}, ns: ${NS_CS})"
-  else
-    echo "Container Security: ${YELLOW}not installed${RESET}"
-  fi
+  [ -n "$(installed_cs)" ] && echo "Container Security: installed (release: ${REL_CS}, ns: ${NS_CS})" \
+                            || echo "Container Security: not installed"
   local fsrel; fsrel="$(installed_fs)"
-  if [ -n "$fsrel" ]; then
-    echo "File Security: ${GREEN}installed${RESET} (release: ${fsrel}, ns: ${FS_NS})"
-  else
-    echo "File Security: ${YELLOW}not installed${RESET}"
-  fi
+  [ -n "$fsrel" ] && echo "File Security: installed (release: ${fsrel}, ns: ${FS_NS})" \
+                  || echo "File Security: not installed"
 
   echo
   box "Pods by Node"
-  # the exact loop you provided
   for n in $(kubectl get nodes -o name | cut -d/ -f2); do
     echo "=== $n ==="
     kubectl get pods -A --field-selector spec.nodeName="$n" -o wide
     echo
   done
 }
+status_board(){
+  box "Status Board (pods across cluster)"
+  printf "%-16s %-38s %-9s %-10s %-16s %-15s\n" "NAMESPACE" "NAME" "READY" "STATUS" "NODE" "POD-IP"
+  hr
+  kubectl get pods -A -o wide --no-headers | awk '{printf "%-16s %-38s %-9s %-10s %-16s %-15s\n", $1,$2,$3,$4,$8,$6}'
+  echo
 
-# -------- Item 1/11: Remove/Install Container Security --------
-item_remove_cs(){
-  echo "${INFO} Uninstalling Container Security (best effort)..."
+  box "Key Namespaces Summary"
+  echo "Container Security (${NS_CS}):"; kubectl -n "$NS_CS" get deploy,ds,po -o wide || true; echo
+  echo "File Security (${FS_NS}):";     kubectl -n "$FS_NS" get deploy,svc,po -o wide || true; echo
+  echo "Default (demos):";              kubectl -n default get deploy,svc,po -o wide || true
+}
+status_urls(){
+  local master node1 node2; master="$(detect_master)"; read -r node1 node2 <<<"$(detect_workers "$master")"
+  local node2ip; node2ip="$(node_ip "$node2")"
+  local ips; ips="$(node_ips_all)"
+
+  box "Remote & Internal Access URLs"
+
+  echo "Malicious Lab (hostPorts on node2)"
+  if [ -n "$node2ip" ]; then
+    echo "  DVWA_VulnerableWebApp  ->  http://${node2ip}:8080"
+    echo "  Malware_Samples        ->  http://${node2ip}:8081"
+  else
+    echo "  ${WARN}node2 IP not found. Ensure a worker is available for hostPorts."
+  fi
+  echo
+
+  echo "Normal Lab (NodePorts on any node)"
+  for ip in $ips; do
+    kubectl -n default get svc openwebui >/dev/null 2>&1 && \
+      echo "  OpenWebUI              ->  http://${ip}:${OPENWEBUI_NODEPORT}"
+    kubectl -n default get svc ollama >/dev/null 2>&1 && \
+      echo "  Ollama API             ->  http://${ip}:${OLLAMA_NODEPORT}/api/version"
+  done
+  echo
+
+  echo "Vision One File Security gRPC (NodePort)"
+  for ip in $ips; do
+    kubectl -n "$FS_NS" get svc "$FS_NODEPORT_SVC" >/dev/null 2>&1 && \
+      echo "  Scanner                ->  ${ip}:${FS_NODEPORT}"
+  done
+}
+
+# ===================== PLATFORM TOOLS =====================
+remove_cs(){
+  echo "${INFO} Cleaning scan jobs first..."
+  cleanup_scan_jobs_now
+  echo "${INFO} Removing TTL enforcer..."
+  remove_ttl_enforcer
+
+  echo "${INFO} Uninstalling Container Security..."
   helm uninstall "$REL_CS" -n "$NS_CS" || true
   kubectl delete ns "$NS_CS" --wait=false || true
-  echo "${OK} Done."
+  echo "${OK} Container Security removed."
 }
-item_install_cs(){
+install_cs(){
   need kubectl; need helm
   echo "== Install/Upgrade Trend Micro Vision One Container Security =="
   read -r -p "Paste NEW Vision One bootstrap token: " BOOTSTRAP_TOKEN
@@ -144,7 +296,6 @@ item_install_cs(){
   esac
   ENDPOINT="https://${API_HOST}/external/v2/direct/vcs/external/vcs"
 
-  # backup then write overrides
   [ -f "$OVERRIDES" ] && cp "$OVERRIDES" "${OVERRIDES}.$(date +%Y%m%d-%H%M%S).bak"
   cat > "$OVERRIDES" <<EOF
 visionOne:
@@ -174,24 +325,27 @@ EOF
   for d in trendmicro-oversight-controller trendmicro-scan-manager trendmicro-policy-operator trendmicro-metacollector trendmicro-admission-controller trendmicro-usage-controller trendmicro-scout; do
     kubectl -n "$NS_CS" rollout status deploy "$d" --timeout=180s || true
   done
-  echo "${OK} Container Security ready (check pods in ${NS_CS})."
-}
 
-# -------- Item 2/22: Remove/Install File Security (with NodePort) --------
-item_remove_fs(){
-  echo "${INFO} Uninstalling File Security (best effort)..."
-  local rel; rel="$(installed_fs)"; [ -z "$rel" ] && rel="$FS_REL_DEFAULT"
+  install_ttl_enforcer
+  echo "${OK} Container Security ready."
+}
+remove_fs(){
+  echo "${INFO} Cleaning scan jobs first..."
+  cleanup_scan_jobs_now
+
+  local rel; rel="$(installed_fs)"; if [ -z "$rel" ]; then rel="$FS_REL_DEFAULT"; fi
+  echo "${INFO} Uninstalling File Security (${rel})..."
   helm uninstall "$rel" -n "$FS_NS" || true
   kubectl delete ns "$FS_NS" --wait=false || true
-  echo "${OK} Done."
+  echo "${OK} File Security removed."
 }
-item_install_fs(){
+install_fs(){
   need kubectl; need helm
   echo "== Install/Upgrade Trend Vision One — File Security =="
   read -r -p "Paste File Security REGISTRATION TOKEN: " FS_TOKEN
   [ -z "$FS_TOKEN" ] && { echo "Token cannot be empty"; exit 1; }
 
-  kubectl create ns "$FS_NS" --dry-run=client -o yaml | kubectl apply -f -
+  ensure_ns "$FS_NS"
   kubectl -n "$FS_NS" create secret generic token-secret \
     --from-literal=registration-token="$FS_TOKEN" \
     --dry-run=client -o yaml | kubectl apply -f -
@@ -200,13 +354,13 @@ item_install_fs(){
 
   helm repo add visionone-filesecurity https://trendmicro.github.io/visionone-file-security-helm/ >/dev/null
   helm repo update >/dev/null
-  local rel; rel="$(installed_fs)"; [ -z "$rel" ] && rel="$FS_REL_DEFAULT"
+  local rel; rel="$(installed_fs)"; if [ -z "$rel" ]; then rel="$FS_REL_DEFAULT"; fi
   helm upgrade --install "$rel" visionone-filesecurity/visionone-filesecurity -n "$FS_NS"
 
   echo "Waiting for scanner to be Ready..."
   kubectl -n "$FS_NS" rollout status deploy "$rel-visionone-filesecurity-scanner" --timeout=300s || true
 
-  # Expose scanner via a dedicated NodePort (persistent, Helm-independent)
+  # Expose scanner via NodePort (persistent, chart-independent)
   cat <<YAML | kubectl apply -f -
 apiVersion: v1
 kind: Service
@@ -227,63 +381,14 @@ spec:
       nodePort: ${FS_NODEPORT}
 YAML
 
+  # Ensure TTL enforcer exists (even if CS not installed)
+  install_ttl_enforcer
+
   echo "${OK} File Security exposed at NodePort ${FS_NODEPORT_SVC}:${FS_NODEPORT}"
 }
 
-# -------- Item 3: Status board --------
-item_status_board(){
-  box "Status Board (pods across cluster)"
-  printf "%-16s %-38s %-9s %-10s %-16s %-15s\n" "NAMESPACE" "NAME" "READY" "STATUS" "NODE" "POD-IP"
-  hr
-  kubectl get pods -A -o wide --no-headers | awk '{printf "%-16s %-38s %-9s %-10s %-16s %-15s\n", $1,$2,$3,$4,$8,$6}'
-  echo
-
-  box "Key Namespaces Summary"
-  echo "Container Security (${NS_CS}):"
-  kubectl -n "$NS_CS" get deploy,ds,po -o wide || true
-  echo
-  echo "File Security (${FS_NS}):"
-  kubectl -n "$FS_NS" get deploy,svc,po -o wide || true
-  echo
-  echo "Default (demos):"
-  kubectl -n default get deploy,svc,po -o wide || true
-}
-
-# -------- Item 4: Show URLs --------
-item_show_urls(){
-  local master node1 node2; master="$(detect_master)"; read -r node1 node2 <<<"$(detect_workers "$master")"
-  local node2ip; node2ip="$(node_ip "$node2")"
-  local ips; ips="$(node_ips_all)"
-
-  box "Remote & Internal Access URLs"
-
-  echo "${BOLD}Malicious Lab (hostPorts on node2)${RESET}"
-  if [ -n "$node2ip" ]; then
-    echo "  DVWA_VulnerableWebApp  ->  ${CYAN}http://${node2ip}:8080${RESET}"
-    echo "  Malware_Samples        ->  ${CYAN}http://${node2ip}:8081${RESET}"
-  else
-    echo "  ${WARN}node2 IP not found. Ensure a worker is labeled/selected for hostPorts."
-  fi
-  echo
-
-  echo "${BOLD}Normal Lab (NodePorts on any node)${RESET}"
-  for ip in $ips; do
-    kubectl -n default get svc openwebui >/dev/null 2>&1 && \
-      echo "  OpenWebUI              ->  ${CYAN}http://${ip}:${OPENWEBUI_NODEPORT}${RESET}"
-    kubectl -n default get svc ollama >/dev/null 2>&1 && \
-      echo "  Ollama API             ->  ${CYAN}http://${ip}:${OLLAMA_NODEPORT}/api/version${RESET}"
-  done
-  echo
-
-  echo "${BOLD}Vision One File Security gRPC (NodePort)${RESET}"
-  for ip in $ips; do
-    kubectl -n "$FS_NS" get svc "$FS_NODEPORT_SVC" >/dev/null 2>&1 && \
-      echo "  Scanner                ->  ${CYAN}${ip}:${FS_NODEPORT}${RESET}"
-  done
-}
-
-# -------- Item 5: Deploy Malicious Lab --------
-item_deploy_malicious(){
+# ===================== DEMOS =====================
+deploy_malicious(){
   local master node1 node2; master="$(detect_master)"; read -r node1 node2 <<<"$(detect_workers "$master")"
   [ -z "$node2" ] && { echo "${ERR} Could not find node2 to pin hostPorts."; exit 1; }
 
@@ -351,9 +456,7 @@ YAML
   kubectl -n default rollout status deploy/malware-samples       --timeout=180s || true
   echo "${OK} Malicious lab deployed."
 }
-
-# -------- Item 6: Deploy Normal Lab --------
-item_deploy_normal(){
+deploy_normal(){
   cat <<'YAML' | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -459,30 +562,55 @@ YAML
   kubectl -n default rollout status deploy/ollama   --timeout=300s || true
   echo "${OK} Normal lab deployed."
 }
-
-# -------- Item 7: Remove labs --------
-item_remove_labs(){
+remove_labs(){
   kubectl -n default delete deploy dvwa-vulnerablewebapp malware-samples openwebui ollama --ignore-not-found
   kubectl -n default delete svc    dvwa-vulnerablewebapp malware-samples openwebui ollama --ignore-not-found
   echo "${OK} Removed demo labs."
 }
 
-# -------- Menu --------
-menu(){
+# ===================== MENUS =====================
+main_menu(){
   clear
-  box "Trend Micro Demo Menu"
+  box "Trend Micro Demo — Main Menu"
   cat <<MENU
-  0) Check status (installed + pods by node)
-  1) Remove Container Security
- 11) Install/Upgrade Container Security
-  2) Remove File Security
- 22) Install/Upgrade File Security (expose via NodePort ${FS_NODEPORT})
-  3) Status board
-  4) Show URLs
-  5) Deploy Malicious Lab (DVWA+Malware)
-  6) Deploy Normal Lab (OpenWebUI+Ollama)
-  7) Remove Malicious & Normal Labs
-  q) Quit
+  [1] STATUS
+  [2] PLATFORM TOOLS (Container/File Security)
+  [3] DEMOS (Post-deployment)
+  [q] Quit
+MENU
+  echo -n "Choose category: "
+}
+status_menu(){
+  clear
+  box "STATUS"
+  cat <<MENU
+  10) Check status (installed + pods by node)
+  11) Status board
+  12) Show URLs
+  b)  Back
+MENU
+  echo -n "Choose: "
+}
+tools_menu(){
+  clear
+  box "PLATFORM TOOLS (Container/File Security)"
+  cat <<MENU
+  20) Install/Upgrade Container Security (with TTL enforcer)
+  21) Remove Container Security
+  22) Install/Upgrade File Security (expose via NodePort ${FS_NODEPORT} + TTL enforcer)
+  23) Remove File Security
+  b)  Back
+MENU
+  echo -n "Choose: "
+}
+demos_menu(){
+  clear
+  box "DEMOS (Post-deployment)"
+  cat <<MENU
+  30) Deploy Malicious Lab (DVWA+Malware)
+  31) Deploy Normal Lab (OpenWebUI+Ollama)
+  32) Remove Malicious & Normal Labs
+  b)  Back
 MENU
   echo -n "Choose: "
 }
@@ -490,20 +618,50 @@ MENU
 # -------- Entry --------
 need kubectl; need helm
 while true; do
-  menu
-  read -r CH
-  case "${CH:-}" in
-    0) item_check_status; read -rp $'\n[enter] ' _ ;;
-    1) item_remove_cs;    read -rp $'\n[enter] ' _ ;;
-   11) item_install_cs;   read -rp $'\n[enter] ' _ ;;
-    2) item_remove_fs;    read -rp $'\n[enter] ' _ ;;
-   22) item_install_fs;   read -rp $'\n[enter] ' _ ;;
-    3) item_status_board; read -rp $'\n[enter] ' _ ;;
-    4) item_show_urls;    read -rp $'\n[enter] ' _ ;;
-    5) item_deploy_malicious; read -rp $'\n[enter] ' _ ;;
-    6) item_deploy_normal;   read -rp $'\n[enter] ' _ ;;
-    7) item_remove_labs;     read -rp $'\n[enter] ' _ ;;
+  main_menu
+  read -r CAT
+  case "${CAT:-}" in
+    1)
+      while true; do
+        status_menu
+        read -r CH
+        case "${CH:-}" in
+          10) status_check;  read -rp $'\n[enter] ' _ ;;
+          11) status_board;  read -rp $'\n[enter] ' _ ;;
+          12) status_urls;   read -rp $'\n[enter] ' _ ;;
+          b|B) break ;;
+          *) echo "${WARN} Invalid option" ;;
+        esac
+      done
+      ;;
+    2)
+      while true; do
+        tools_menu
+        read -r CH
+        case "${CH:-}" in
+          20) install_cs; read -rp $'\n[enter] ' _ ;;
+          21) remove_cs;  read -rp $'\n[enter] ' _ ;;
+          22) install_fs; read -rp $'\n[enter] ' _ ;;
+          23) remove_fs;  read -rp $'\n[enter] ' _ ;;
+          b|B) break ;;
+          *) echo "${WARN} Invalid option" ;;
+        esac
+      done
+      ;;
+    3)
+      while true; do
+        demos_menu
+        read -r CH
+        case "${CH:-}" in
+          30) deploy_malicious; read -rp $'\n[enter] ' _ ;;
+          31) deploy_normal;    read -rp $'\n[enter] ' _ ;;
+          32) remove_labs;      read -rp $'\n[enter] ' _ ;;
+          b|B) break ;;
+          *) echo "${WARN} Invalid option" ;;
+        esac
+      done
+      ;;
     q|Q) exit 0 ;;
-    *) echo "${WARN} Invalid option" ;;
+    *) echo "${WARN} Invalid category" ;;
   esac
 done
