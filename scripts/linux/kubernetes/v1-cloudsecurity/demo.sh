@@ -665,3 +665,4 @@ while true; do
     *) echo "${WARN} Invalid category" ;;
   esac
 done
+root@lab-kube-master:/home/skynet# 
